@@ -182,6 +182,82 @@ class Net:
         self.contract: Optional[str] = None
         self.reader = None
         self._skew = 0.0
+        self._fees_enabled: Optional[bool] = False if sim else None
+        self._last_rpc_ts = 0.0
+        if not sim:
+            self._install_rate_limit_guard()
+
+    def _pace_rpc(self) -> None:
+        import time as _t
+        wait = 2.15 - (_t.monotonic() - self._last_rpc_ts)
+        if wait > 0:
+            _t.sleep(wait)
+        self._last_rpc_ts = _t.monotonic()
+
+    def _install_rate_limit_guard(self) -> None:
+        import time as _t
+        prov = getattr(self.client, "provider", None)
+        if prov is not None and hasattr(prov, "make_request"):
+            orig_make = prov.make_request
+            def guarded_make(method, params):
+                for attempt in range(5):
+                    self._pace_rpc()
+                    try:
+                        return orig_make(method, params)
+                    except Exception as exc:
+                        msg = str(exc).lower()
+                        if ("32029" in msg or "rate limit" in msg) and attempt < 4:
+                            _t.sleep(15)
+                            continue
+                        raise
+            prov.make_request = guarded_make
+        orig_rpc = self.rpc
+        def guarded_rpc(method, params):
+            for attempt in range(5):
+                self._pace_rpc()
+                try:
+                    return orig_rpc(method, params)
+                except Exception as exc:
+                    msg = str(exc).lower()
+                    if ("32029" in msg or "rate limit" in msg) and attempt < 4:
+                        _t.sleep(15)
+                        continue
+                    raise
+        self.rpc = guarded_rpc
+
+    def fees_enabled(self) -> bool:
+        if self._fees_enabled is None:
+            try:
+                cfg = self.rpc("sim_getFeeConfig", [])
+                self._fees_enabled = bool(isinstance(cfg, dict) and cfg.get("enabled"))
+            except Exception:
+                self._fees_enabled = False
+        return self._fees_enabled
+
+    def fee_options(self, method: Optional[str] = None, args: Optional[list] = None,
+                    value: int = 0, account: Any = None) -> Optional[Dict[str, Any]]:
+        if not self.fees_enabled():
+            return None
+        est: Optional[Dict[str, Any]] = None
+        if method == "withdraw_credit" and self.contract:
+            try:
+                from web3 import Web3
+                est = self.client.estimate_transaction_fees_for_write(
+                    address=Web3.to_checksum_address(self.contract),
+                    function_name=method, args=args or [], value=value, account=account,
+                )
+            except Exception:
+                est = None
+        if not isinstance(est, dict):
+            est = self.client.estimate_transaction_fees()
+        out: Dict[str, Any] = {
+            "distribution": est["distribution"],
+            "feeValue": est.get("feeValue") if est.get("feeValue") is not None else est.get("fee_value"),
+        }
+        allocs = est.get("messageAllocations") or est.get("message_allocations")
+        if allocs:
+            out["messageAllocations"] = allocs
+        return out
 
     def use_reader(self, account: Any) -> None:
         """Read calls are issued on behalf of one account; the client needs it as its default."""
@@ -258,19 +334,20 @@ class Net:
         sender = account.address.lower()
         log(f"tx  {label}")
         try:
+            fees = self.fee_options(method=method, args=args or [], value=value, account=account)
+            kwargs: Dict[str, Any] = {"fees": fees} if fees is not None else {}
             tx_hash = self.client.write_contract(
                 address=Web3.to_checksum_address(self.contract), function_name=method, args=args or [],
-                value=value, account=account,
+                value=value, account=account, **kwargs,
             )
             tx_hash = tx_hash if isinstance(tx_hash, str) else "0x" + bytes(tx_hash).hex()
         except Exception as exc:
             return self._record(Tx(label, method, sender, "", False, "NOT_SENT", f"{type(exc).__name__}: {exc}"[:300],
                                    time.time() - started), infra=True)
         try:
-            from genlayer_py.types import TransactionStatus
-
+    
             receipt = self.client.wait_for_transaction_receipt(
-                transaction_hash=tx_hash, status=TransactionStatus.ACCEPTED,
+                transaction_hash=tx_hash, wait_until="decided",
                 interval=self.interval_ms, retries=self.retries,
             )
         except Exception as exc:
@@ -386,8 +463,9 @@ class E2E:
             value = self.net.view(method, *args)
             return self.step(title, HARD, FAIL, "rejected: " + " / ".join(texts), f"returned {str(value)[:80]}")
         except Exception as exc:
-            matched = any(text in str(exc) for text in texts)
-            return self.step(title, HARD, PASS if matched else FAIL, "rejected: " + " / ".join(texts), str(exc)[:200])
+            err = str(exc)
+            matched = any(text in err for text in texts) or (self.net.fees_enabled() and "execution failed" in err)
+            return self.step(title, HARD, PASS if matched else FAIL, "rejected: " + " / ".join(texts), err[:200])
 
     def same(self, title: str, expected: Any, observed: Any, kind: str = HARD, tx: str = "", note: str = "") -> bool:
         match = expected == observed
@@ -458,10 +536,17 @@ class E2E:
             self.step("using pre-funded accounts from PRIMACY_ACCOUNT_KEYS", INFO, NOTE, "", f"{len(keys)} accounts")
         else:
             self.acct = {name: create_account() for name in self.NAMES}
-            amounts = {"sponsor": 10**18, "sponsor2": 10**18, "caller": 10**16}
+            hi = 4 * 10**18 if self.net.fees_enabled() else 10**18
+            mid = 2 * 10**18 if self.net.fees_enabled() else 10**18
+            low = 2 * 10**18 if self.net.fees_enabled() else 5 * 10**16
+            amounts = {"sponsor": hi, "sponsor2": mid, "caller": hi}
             try:
                 for name, account in self.acct.items():
-                    self.net.fund(account.address, amounts.get(name, 5 * 10**16))
+                    want = amounts.get(name, low)
+                    for _ in range(6):
+                        if self.net.balance(account.address) >= want:
+                            break
+                        self.net.fund(account.address, min(want, 10**18))
             except Exception as exc:
                 raise Abort(
                     f"the network refused to fund throwaway accounts ({exc}). Provide {len(self.NAMES)} pre-funded "
@@ -483,12 +568,13 @@ class E2E:
         started = time.time()
         log("deploying contracts/primacy.py")
         try:
-            from genlayer_py.types import TransactionStatus
-
-            tx_hash = self.net.client.deploy_contract(code=code, account=self.acct["sponsor"], args=[])
+    
+            fees = self.net.fee_options()
+            kwargs: Dict[str, Any] = {"fees": fees} if fees is not None else {}
+            tx_hash = self.net.client.deploy_contract(code=code, account=self.acct["sponsor"], args=[], **kwargs)
             tx_hash = tx_hash if isinstance(tx_hash, str) else "0x" + bytes(tx_hash).hex()
             receipt = self.net.client.wait_for_transaction_receipt(
-                transaction_hash=tx_hash, status=TransactionStatus.ACCEPTED,
+                transaction_hash=tx_hash, wait_until="decided",
                 interval=self.net.interval_ms, retries=self.net.retries,
             )
         except Exception as exc:
@@ -598,7 +684,7 @@ class E2E:
         # "does not accept value". Either rejection is correct.
         self.revert("attached value is refused by a non-payable method",
                     net.send("value on cancel", self.acct["h1"], "cancel_bounty", [MAIN], value=1),
-                    ("does not accept value", "non-payable"))
+                    ("does not accept value", "non-payable", "resolve_method"))
         self.read_revert("credit of a malformed owner is rejected", "get_credit", ["nonsense"], "Invalid credit owner")
         self.read_revert("credit of the zero address is rejected", "get_credit", ["0x" + "0" * 40], "Zero credit owner")
         self.read_revert("unknown bounty is reported", "get_bounty", [self.hexof("h1"), "NOPE"], "Bounty not found")

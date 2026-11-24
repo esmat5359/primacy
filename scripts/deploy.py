@@ -39,7 +39,6 @@ def main(argv=None) -> int:
         import requests
         from genlayer_py import create_account, create_client
         from genlayer_py.chains import studionet
-        from genlayer_py.types import TransactionStatus
         from web3 import Web3
     except ImportError as exc:
         print(f"missing dependency ({exc}); run: pip install -r requirements.txt", file=sys.stderr)
@@ -64,10 +63,18 @@ def main(argv=None) -> int:
     code = (ROOT / "contracts" / "primacy.py").read_text(encoding="utf-8")
     print(f"deploying from {account.address} to {args.rpc}")
     try:
-        tx_hash = client.deploy_contract(code=code, account=account, args=[])
+        kwargs = {}
+        try:
+            cfg = requests.post(args.rpc, json={"jsonrpc": "2.0", "id": 9, "method": "sim_getFeeConfig", "params": []}, timeout=20).json().get("result")
+            if isinstance(cfg, dict) and cfg.get("enabled"):
+                est = client.estimate_transaction_fees()
+                kwargs["fees"] = {"distribution": est["distribution"], "feeValue": est.get("feeValue") or est.get("fee_value")}
+        except Exception:
+            pass
+        tx_hash = client.deploy_contract(code=code, account=account, args=[], **kwargs)
         tx_hash = tx_hash if isinstance(tx_hash, str) else "0x" + bytes(tx_hash).hex()
         receipt = client.wait_for_transaction_receipt(
-            transaction_hash=tx_hash, status=TransactionStatus.ACCEPTED, interval=3000,
+            transaction_hash=tx_hash, wait_until="decided", interval=3000,
             retries=max(2, args.timeout // 3),
         )
     except Exception as exc:
